@@ -964,6 +964,7 @@ class _DashboardScreenState extends State<DashboardScreen>
       await prefs.remove('driver_name');
       await prefs.remove('vehicle_number');
       await prefs.remove('school_name');
+      await prefs.remove('school_id');
 
       if (!mounted) return;
       Navigator.pushReplacement(

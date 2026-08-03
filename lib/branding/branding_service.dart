@@ -13,6 +13,12 @@ class BrandingService {
   static const String _key = 'branding_payload';
   static const Duration _timeout = Duration(seconds: 10);
 
+  /// Which app this binary is, for the per-app brand. Sent as `?app=` so the
+  /// driver's action colour is configured independently of the staff app's FAB
+  /// — the two used to share one field (see backend
+  /// docs/per-app-branding-plan.md).
+  static const String _app = 'driver';
+
   /// Read the cached branding for instant, offline bootstrap.
   static Future<Branding> loadCached() async {
     try {
@@ -30,19 +36,28 @@ class BrandingService {
     return const Branding.fallback();
   }
 
-  /// Fetch the platform brand and cache the raw payload. On any failure returns
-  /// the cached/fallback brand — never throws.
+  /// Fetch the driver brand and cache the raw payload. Once the driver has
+  /// logged in, the stored school is sent so the school's own driver brand is
+  /// resolved; before that (and if the backend predates it) the platform brand
+  /// comes back. On any failure returns the cached/fallback brand — never throws.
   static Future<Branding> fetchAndCache() async {
     try {
+      final prefs = await SharedPreferences.getInstance();
+      final schoolId = prefs.getInt('school_id');
+
       final response = await http.get(
-        Uri.parse('${ApiService.baseUrl}/api/v1/branding'),
+        Uri.parse('${ApiService.baseUrl}/api/v1/branding').replace(
+          queryParameters: {
+            'app': _app,
+            if (schoolId != null) 'school_id': '$schoolId',
+          },
+        ),
         headers: {'Accept': 'application/json'},
       ).timeout(_timeout);
 
       if (response.statusCode == 200) {
         final decoded = jsonDecode(response.body);
         if (decoded is Map) {
-          final prefs = await SharedPreferences.getInstance();
           await prefs.setString(_key, response.body);
           return Branding.fromJson(Map<String, dynamic>.from(decoded));
         }

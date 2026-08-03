@@ -38,6 +38,7 @@ class ApiService {
         await prefs.setString('driver_name', data['driver_name'] ?? 'Driver');
         await prefs.setString('vehicle_number', data['vehicle_number'] ?? '');
         await prefs.setString('school_name', data['school_name'] ?? '');
+        await saveSchoolId(data['school_id']);
       }
 
       return responseData;
@@ -46,6 +47,18 @@ class ApiService {
     } catch (e) {
       return {'status': 'error', 'message': 'Connection failed: ${e.toString()}'};
     }
+  }
+
+  /// Persist the logged-in school so [BrandingService] can ask for THIS school's
+  /// driver brand instead of the platform default. Tolerates an int or a string
+  /// (and an older backend that omits the key entirely — then nothing is stored
+  /// and branding stays on the platform brand, exactly as before).
+  static Future<void> saveSchoolId(dynamic raw) async {
+    final id = raw is int ? raw : int.tryParse('${raw ?? ''}');
+    if (id == null) return;
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt('school_id', id);
   }
 
   /// Returns true when the backend runs in demo mode. Defaults to false on any
@@ -84,6 +97,7 @@ class ApiService {
         await prefs.setString('driver_name', data['driver_name'] ?? 'Driver');
         await prefs.setString('vehicle_number', data['vehicle_number'] ?? '');
         await prefs.setString('school_name', data['school_name'] ?? '');
+        await saveSchoolId(data['school_id']);
       }
 
       return responseData;
