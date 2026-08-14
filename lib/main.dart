@@ -1,51 +1,27 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:shared_preferences/shared_preferences.dart';
-import 'package:flutter_background_service/flutter_background_service.dart';
-import 'package:geolocator/geolocator.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'branding/brand_logo.dart';
 import 'branding/branding.dart';
+import 'branding/branding_providers.dart';
+import 'core/theme/app_colors.dart';
 import 'branding/branding_service.dart';
 import 'config/app_config.dart';
 import 'services/api_service.dart';
 import 'services/background_service.dart';
-import 'services/update_service.dart';
-
-// =============================================================================
-// DESIGN TOKENS
-// =============================================================================
-abstract final class AppColors {
-  // Primary gradient — deep navy (fixed dark identity, not brand-configurable)
-  static const Color primary = Color(0xFF0D1B2A);
-  static const Color primaryLight = Color(0xFF1B2D45);
-
-  // Accent — the action color. RUNTIME-mutable via [applyBranding]; do not use
-  // in `const` expressions.
-  static Color accent = const Color(0xFF00C9A7);
-  static Color accentDark = const Color(0xFF00A388);
-
-  /// Apply a resolved [Branding] to the runtime-mutable accent tokens.
-  static void applyBranding(Branding b) {
-    accent = b.accent;
-    accentDark = b.accentDark;
-  }
-
-  // Status
-  static const Color success = Color(0xFF00E676);
-  static const Color successDark = Color(0xFF00C853);
-  static const Color danger = Color(0xFFFF5252);
-  static const Color dangerDark = Color(0xFFD32F2F);
-  static const Color warning = Color(0xFFFFAB40);
-
-  // Surfaces
-  static const Color surface = Color(0xFF112240);
-  static const Color surfaceLight = Color(0xFF1A3358);
-  static const Color cardDark = Color(0xFF0A192F);
-
-  // Text
-  static const Color textPrimary = Color(0xFFE6F1FF);
-  static const Color textSecondary = Color(0xFF8892B0);
-  static const Color textMuted = Color(0xFF5A6A8A);
-}
+import 'core/alarms/alarm_controller.dart';
+import 'core/alarms/alarm_service.dart';
+import 'core/providers.dart';
+import 'core/push/driver_push.dart';
+import 'core/readiness/readiness.dart';
+import 'core/session/session.dart';
+import 'core/tracking/tracking_gate.dart';
+import 'features/alarm/alarm_screen.dart';
+import 'features/auth/scan_setup_screen.dart';
+import 'features/readiness/readiness_screen.dart';
+import 'features/today/today_screen.dart';
 
 // =============================================================================
 // MAIN
@@ -59,18 +35,51 @@ void main() async {
   AppColors.applyBranding(brand);
 
   await initializeService();
-  runApp(DriverApp(initialBranding: brand));
+
+  // The container is built by hand rather than by ProviderScope so the alarm
+  // plugin — which is initialised before the first frame and calls back from
+  // outside the widget tree — can push into the same state the UI reads.
+  final container = ProviderContainer();
+
+  // Seed the brand before the first frame so the login screen paints the
+  // school's logo immediately instead of the bundled one.
+  container.read(brandingProvider.notifier).state = brand;
+
+  await AlarmService.init(
+    onSelect: (target, actionId) {
+      // Even the "START TRIP" action button lands on the alarm screen rather
+      // than starting the trip outright. Starting needs the tracking gate to
+      // pass first, and a trip that opens on a phone with no background
+      // location is exactly the silent failure §7 exists to prevent.
+      container.read(pendingAlarmProvider.notifier).raise(target);
+    },
+  );
+
+  // Cold start FROM an alarm is the normal case at 06:45 — the app was not
+  // open. Without this the driver taps the alarm and lands on Today, wondering
+  // what it wanted.
+  final launchedBy = await AlarmService.launchTarget();
+  if (launchedBy != null) {
+    container.read(pendingAlarmProvider.notifier).raise(launchedBy);
+  }
+
+  runApp(
+    UncontrolledProviderScope(
+      container: container,
+      child: DriverApp(initialBranding: brand),
+    ),
+  );
 }
 
-class DriverApp extends StatefulWidget {
+class DriverApp extends ConsumerStatefulWidget {
   final Branding initialBranding;
   const DriverApp({super.key, required this.initialBranding});
 
   @override
-  State<DriverApp> createState() => _DriverAppState();
+  ConsumerState<DriverApp> createState() => _DriverAppState();
 }
 
-class _DriverAppState extends State<DriverApp> {
+class _DriverAppState extends ConsumerState<DriverApp> {
   late Branding _branding = widget.initialBranding;
 
   @override
@@ -82,6 +91,9 @@ class _DriverAppState extends State<DriverApp> {
       final fetched = (await BrandingService.fetchAndCache()).effective;
       if (!mounted) return;
       AppColors.applyBranding(fetched);
+      // Colours go to the token class, the logo goes to the provider — the
+      // widgets that draw it are rebuilt by this, not by the setState below.
+      ref.read(brandingProvider.notifier).state = fetched;
       setState(() => _branding = fetched);
     });
   }
@@ -92,32 +104,199 @@ class _DriverAppState extends State<DriverApp> {
       title: _branding.appName,
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        brightness: Brightness.dark,
+        brightness: Brightness.light,
         scaffoldBackgroundColor: AppColors.primary,
-        colorScheme: ColorScheme.dark(
+        colorScheme: ColorScheme.light(
           primary: AppColors.accent,
           secondary: AppColors.accentDark,
           surface: AppColors.surface,
-          onPrimary: AppColors.primary,
+          onPrimary: Colors.white,
           onSurface: AppColors.textPrimary,
         ),
         fontFamily: 'Roboto',
         useMaterial3: true,
+        // Bigger than Material's defaults across the board. The reader is
+        // often 50+, holding the phone at arm's length in a moving bus.
+        textTheme: const TextTheme(
+          bodyLarge: TextStyle(fontSize: 17, color: AppColors.textPrimary),
+          bodyMedium: TextStyle(fontSize: 15, color: AppColors.textPrimary),
+          bodySmall: TextStyle(fontSize: 13, color: AppColors.textSecondary),
+        ),
         appBarTheme: const AppBarTheme(
           backgroundColor: Colors.transparent,
+          foregroundColor: AppColors.textPrimary,
           elevation: 0,
           centerTitle: false,
-          systemOverlayStyle: SystemUiOverlayStyle.light,
+          // Dark status-bar icons now that the canvas is light.
+          systemOverlayStyle: SystemUiOverlayStyle.dark,
+        ),
+        cardTheme: CardThemeData(
+          color: AppColors.surface,
+          elevation: 0,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        ),
+        snackBarTheme: const SnackBarThemeData(
+          behavior: SnackBarBehavior.floating,
+          contentTextStyle: TextStyle(color: Colors.white, fontSize: 15),
         ),
       ),
-      home: const SplashScreen(),
+      home: const _Root(),
     );
+  }
+}
+
+// =============================================================================
+// ROOT — session gate
+// =============================================================================
+/// Decides what the app shows, from one piece of state.
+///
+/// Routing off the session (rather than pushing screens from inside the login
+/// flow) is what makes sign-out, a revoked device and a 401 all behave
+/// identically: clear the session, and every screen unwinds by itself.
+class _Root extends ConsumerStatefulWidget {
+  const _Root();
+
+  @override
+  ConsumerState<_Root> createState() => _RootState();
+}
+
+class _RootState extends ConsumerState<_Root> with WidgetsBindingObserver {
+  bool _restoring = true;
+
+  /// Null until the first sweep finishes. §7 Layer 1 gates on this: a driver
+  /// must not reach the Today screen on a phone that cannot track.
+  bool? _ready;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await ref.read(sessionProvider.notifier).restore();
+      if (!mounted) return;
+
+      setState(() => _restoring = false);
+      await _afterSignIn();
+    });
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) return;
+    if (ref.read(sessionProvider) == null) return;
+
+    // A permission revoked while the app was in the background is one of the
+    // five §7 failure modes, and it looks identical to every other one from the
+    // parent's side. Catch it the moment the driver comes back.
+    _refreshReadiness();
+
+    // Pick up a mode change the office made while the app was away, so
+    // switching a driver to `full` takes effect without a re-login.
+    ref
+        .read(sessionProvider.notifier)
+        .refreshProfile(ref.read(driverApiProvider));
+  }
+
+  /// Everything that has to happen once there is a signed-in driver: check the
+  /// phone, arm the week's alarms, and put the duty service on watch.
+  Future<void> _afterSignIn() async {
+    if (ref.read(sessionProvider) == null) return;
+
+    // Reconcile the profile on LAUNCH, not just on resume.
+    //
+    // A restored session is rebuilt from SharedPreferences, so it only ever
+    // holds what was persisted at the last sign-in. Anything the server learned
+    // to send since then — the school's contact details, a mode the office
+    // changed — stayed missing until the driver happened to background and
+    // foreground the app, which on a phone left in a cradle all day is never.
+    //
+    // Not awaited: this is a network round trip and the readiness gate below
+    // must not wait on it. Silent on failure, so an offline launch is unchanged.
+    unawaited(
+      ref.read(sessionProvider.notifier).refreshProfile(ref.read(driverApiProvider)),
+    );
+
+    await _refreshReadiness();
+
+    if (_ready != true) return;
+
+    // Push before arming: the server's T-30 rung re-arms the alarms while the
+    // app is backgrounded, and it can only do that once this handset has an FCM
+    // token registered against its device row.
+    await DriverPush.start();
+
+    // Arming is idempotent and falls back to the cached timetable offline, so
+    // running it on every launch is both safe and the main re-arm trigger.
+    await ref.read(adherenceProvider.notifier).refreshAndArm();
+
+    // The service decides its own mode from here (trip / watch / idle). Started
+    // unconditionally because Layers 4 and 5 have to work BETWEEN runs — that
+    // is the entire point of them.
+    await TrackingGate.startService();
+  }
+
+  Future<void> _refreshReadiness() async {
+    final report = await ReadinessService.evaluate();
+
+    if (!mounted) return;
+
+    setState(() => _ready = report.canProceed);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // Sign-in and sign-out both run through here, so the checklist, the alarms
+    // and the duty service follow the session rather than being kicked off from
+    // inside the login form.
+    ref.listen<Session?>(sessionProvider, (previous, next) {
+      if (next == null) {
+        setState(() => _ready = null);
+      } else if (previous == null) {
+        _afterSignIn();
+      }
+    });
+
+    if (_restoring) return const SplashScreen();
+
+    final session = ref.watch(sessionProvider);
+
+    if (session == null) return const LoginScreen();
+
+    // Warm the outbox watcher so a queue left over from a previous run starts
+    // draining as soon as the driver is signed in again.
+    ref.watch(outboxProvider);
+
+    if (_ready == null) return const SplashScreen();
+
+    if (_ready == false) {
+      return ReadinessScreen(onPassed: _afterSignIn);
+    }
+
+    // An alarm outranks everything else on screen. It is not pushed as a route
+    // — it is what the app IS while it is unanswered, which is why there is no
+    // back gesture off it.
+    final alarm = ref.watch(pendingAlarmProvider);
+
+    if (alarm != null) return AlarmScreen(target: alarm);
+
+    return const TodayScreen();
   }
 }
 
 // =============================================================================
 // SPLASH SCREEN — Premium animated entry
 // =============================================================================
+/// Purely a visual while the session is restored from disk.
+///
+/// It no longer decides anything: _Root owns that, so there is exactly one
+/// place that answers "signed in or not".
 class SplashScreen extends StatefulWidget {
   const SplashScreen({super.key});
 
@@ -145,42 +324,12 @@ class _SplashScreenState extends State<SplashScreen>
       CurvedAnimation(parent: _animController, curve: Curves.elasticOut),
     );
     _animController.forward();
-    _checkLogin();
   }
 
   @override
   void dispose() {
     _animController.dispose();
     super.dispose();
-  }
-
-  Future<void> _checkLogin() async {
-    final prefs = await SharedPreferences.getInstance();
-    final token = prefs.getString('api_token');
-    final driverName = prefs.getString('driver_name');
-
-    await Future.delayed(const Duration(milliseconds: 1800));
-
-    if (!mounted) return;
-
-    if (token != null && token.isNotEmpty) {
-      Navigator.pushReplacement(
-        context,
-        _fadeRoute(
-          DashboardScreen(
-            token: token,
-            driverName: driverName ?? 'Driver',
-            vehicleNumber: prefs.getString('vehicle_number') ?? '',
-            schoolName: prefs.getString('school_name') ?? '',
-          ),
-        ),
-      );
-    } else {
-      Navigator.pushReplacement(
-        context,
-        _fadeRoute(const LoginScreen()),
-      );
-    }
   }
 
   @override
@@ -266,23 +415,25 @@ class _SplashScreenState extends State<SplashScreen>
 // =============================================================================
 // LOGIN SCREEN — Premium glass-morphism style
 // =============================================================================
-class LoginScreen extends StatefulWidget {
+class LoginScreen extends ConsumerStatefulWidget {
   const LoginScreen({super.key});
 
   @override
-  State<LoginScreen> createState() => _LoginScreenState();
+  ConsumerState<LoginScreen> createState() => _LoginScreenState();
 }
 
-class _LoginScreenState extends State<LoginScreen>
+class _LoginScreenState extends ConsumerState<LoginScreen>
     with SingleTickerProviderStateMixin {
-  final _schoolEmailController = TextEditingController();
-  final _vehicleNumberController = TextEditingController();
-  final _passwordController = TextEditingController();
+  final _loginCodeController = TextEditingController();
+  final _pinController = TextEditingController();
+  final _setupCodeController = TextEditingController();
+  final _newPinController = TextEditingController();
   final _formKey = GlobalKey<FormState>();
 
   bool _isLoading = false;
   bool _obscurePassword = true;
   bool _isDemoMode = false;
+  bool _isSetupMode = false;
   String _errorMessage = '';
 
   late AnimationController _animController;
@@ -315,45 +466,74 @@ class _LoginScreenState extends State<LoginScreen>
   @override
   void dispose() {
     _animController.dispose();
-    _schoolEmailController.dispose();
-    _vehicleNumberController.dispose();
-    _passwordController.dispose();
+    _loginCodeController.dispose();
+    _pinController.dispose();
+    _setupCodeController.dispose();
+    _newPinController.dispose();
     super.dispose();
   }
 
+  /// Sign in with the Driver ID and PIN issued by the school office.
   Future<void> _login() async {
     if (!_formKey.currentState!.validate()) return;
 
+    await _submit(() => ApiService.loginWithCode(
+          _loginCodeController.text,
+          _pinController.text,
+        ));
+  }
+
+  /// Read the token off the office's printed QR.
+  ///
+  /// Fills the field rather than submitting: the driver still has to choose a
+  /// PIN, and silently signing them in from a scan would skip that.
+  Future<void> _scanSetupCode() async {
+    final token = await Navigator.of(context).push<String>(
+      MaterialPageRoute(builder: (_) => const ScanSetupScreen()),
+    );
+
+    if (token == null || !mounted) return;
+
+    setState(() {
+      _setupCodeController.text = token;
+      _errorMessage = '';
+    });
+  }
+
+  /// First run: exchange the setup code from the office for a session and set
+  /// a PIN the driver chooses themselves.
+  Future<void> _setup() async {
+    if (!_formKey.currentState!.validate()) return;
+
+    await _submit(() => ApiService.enrol(
+          _setupCodeController.text,
+          _newPinController.text,
+        ));
+  }
+
+  /// Everything after a successful sign-in is identical whichever door was
+  /// used, so the navigation and error handling live in one place.
+  Future<void> _submit(Future<Map<String, dynamic>> Function() request) async {
     setState(() {
       _isLoading = true;
       _errorMessage = '';
     });
 
     try {
-      final result = await ApiService.login(
-        _schoolEmailController.text.trim(),
-        _vehicleNumberController.text.trim(),
-        _passwordController.text,
-      );
+      final result = await request();
 
       if (!mounted) return;
 
       if (result['status'] == 'success') {
-        final data = result['data'];
-        Navigator.pushReplacement(
-          context,
-          _fadeRoute(
-            DashboardScreen(
-              token: data['api_token'],
-              driverName: data['driver_name'] ?? 'Driver',
-              vehicleNumber: data['vehicle_number'] ?? '',
-              schoolName: data['school_name'] ?? '',
-            ),
-          ),
-        );
+        // Hand the payload to the session; _Root swaps the screen. No
+        // navigation from here, so sign-in and session-restore take exactly the
+        // same path into the app.
+        await ref
+            .read(sessionProvider.notifier)
+            .signIn(Session.fromPayload(result['data'] as Map<String, dynamic>));
       } else {
         setState(() {
-          _errorMessage = result['message'] ?? 'Login failed. Please try again.';
+          _errorMessage = result['message'] ?? 'Sign-in failed. Please try again.';
         });
       }
     } catch (e) {
@@ -376,18 +556,9 @@ class _LoginScreenState extends State<LoginScreen>
       if (!mounted) return;
 
       if (result['status'] == 'success') {
-        final data = result['data'];
-        Navigator.pushReplacement(
-          context,
-          _fadeRoute(
-            DashboardScreen(
-              token: data['api_token'],
-              driverName: data['driver_name'] ?? 'Driver',
-              vehicleNumber: data['vehicle_number'] ?? '',
-              schoolName: data['school_name'] ?? '',
-            ),
-          ),
-        );
+        await ref
+            .read(sessionProvider.notifier)
+            .signIn(Session.fromPayload(result['data'] as Map<String, dynamic>));
       } else {
         setState(() {
           _errorMessage = result['message'] ?? 'Demo login is unavailable right now.';
@@ -458,33 +629,37 @@ class _LoginScreenState extends State<LoginScreen>
                     child: Column(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        // Logo
+                        // The brand mark. A WHITE plate, not the accent circle
+                        // it replaces: a school logo is almost always dark ink
+                        // on transparency, and dropping one onto a saturated
+                        // brand-coloured disc turns it into a smudge. The
+                        // coloured glow keeps the accent doing the work the
+                        // filled circle used to do.
                         Container(
-                          width: 80,
-                          height: 80,
+                          width: 104,
+                          height: 104,
+                          padding: const EdgeInsets.all(14),
                           decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-                            gradient: LinearGradient(
-                              colors: [AppColors.accent, AppColors.accentDark],
+                            color: AppColors.surface,
+                            borderRadius: BorderRadius.circular(28),
+                            border: Border.all(
+                              color: AppColors.accent.withValues(alpha: 0.18),
                             ),
                             boxShadow: [
                               BoxShadow(
-                                color: AppColors.accent.withOpacity(0.3),
-                                blurRadius: 24,
-                                spreadRadius: 2,
+                                color: AppColors.accent.withValues(alpha: 0.22),
+                                blurRadius: 28,
+                                spreadRadius: 1,
+                                offset: const Offset(0, 8),
                               ),
                             ],
                           ),
-                          child: const Icon(
-                            Icons.local_shipping_rounded,
-                            size: 36,
-                            color: Colors.white,
-                          ),
+                          child: const BrandLogo(),
                         ),
                         const SizedBox(height: 20),
-                        const Text(
-                          'Driver Login',
-                          style: TextStyle(
+                        Text(
+                          _isSetupMode ? 'Set Up This Phone' : 'Driver Login',
+                          style: const TextStyle(
                             fontSize: 26,
                             fontWeight: FontWeight.bold,
                             color: AppColors.textPrimary,
@@ -492,9 +667,12 @@ class _LoginScreenState extends State<LoginScreen>
                           ),
                         ),
                         const SizedBox(height: 6),
-                        const Text(
-                          'Sign in to start tracking',
-                          style: TextStyle(
+                        Text(
+                          _isSetupMode
+                              ? 'Enter the setup code from your school office'
+                              : 'Sign in to start tracking',
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
                             fontSize: 14,
                             color: AppColors.textSecondary,
                           ),
@@ -526,58 +704,131 @@ class _LoginScreenState extends State<LoginScreen>
                             ),
                           ),
 
-                        // School email
-                        TextFormField(
-                          controller: _schoolEmailController,
-                          decoration: _inputDecoration(
-                            label: 'School Email / Domain',
-                            icon: Icons.school_rounded,
-                          ),
-                          keyboardType: TextInputType.emailAddress,
-                          style: const TextStyle(color: AppColors.textPrimary),
-                          validator: (v) =>
-                              v == null || v.isEmpty ? 'Required' : null,
-                        ),
-                        const SizedBox(height: 16),
-
-                        // Vehicle number
-                        TextFormField(
-                          controller: _vehicleNumberController,
-                          decoration: _inputDecoration(
-                            label: 'Vehicle Number',
-                            icon: Icons.directions_bus_rounded,
-                          ),
-                          textCapitalization: TextCapitalization.characters,
-                          style: const TextStyle(color: AppColors.textPrimary),
-                          validator: (v) =>
-                              v == null || v.isEmpty ? 'Required' : null,
-                        ),
-                        const SizedBox(height: 16),
-
-                        // Password
-                        TextFormField(
-                          controller: _passwordController,
-                          decoration: _inputDecoration(
-                            label: 'Password',
-                            icon: Icons.lock_outline_rounded,
-                            suffixIcon: IconButton(
-                              icon: Icon(
-                                _obscurePassword
-                                    ? Icons.visibility_off_outlined
-                                    : Icons.visibility_outlined,
-                                color: AppColors.textMuted,
-                                size: 20,
+                        // ── FIRST-RUN SETUP ────────────────────────────────
+                        // The setup code comes from the school office (printed
+                        // under the QR on the driver's card). The driver then
+                        // picks their OWN PIN — nobody reads one out to them.
+                        if (_isSetupMode) ...[
+                          // Scanning first, typing as the fallback. The office
+                          // prints the QR already, and a driver hand-entering a
+                          // 40-character token at the counter is where first-run
+                          // setup actually fails.
+                          SizedBox(
+                            width: double.infinity,
+                            height: 54,
+                            child: OutlinedButton.icon(
+                              onPressed: _isLoading ? null : _scanSetupCode,
+                              style: OutlinedButton.styleFrom(
+                                foregroundColor: AppColors.accent,
+                                side: BorderSide(
+                                    color: AppColors.accent.withValues(alpha: 0.6)),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(14),
+                                ),
                               ),
-                              onPressed: () =>
-                                  setState(() => _obscurePassword = !_obscurePassword),
+                              icon: const Icon(Icons.qr_code_scanner_rounded),
+                              label: const Text('SCAN SETUP QR',
+                                  style: TextStyle(
+                                      fontWeight: FontWeight.w800, letterSpacing: 0.8)),
                             ),
                           ),
-                          obscureText: _obscurePassword,
-                          style: const TextStyle(color: AppColors.textPrimary),
-                          onFieldSubmitted: (_) => _login(),
-                          validator: (v) =>
-                              v == null || v.isEmpty ? 'Required' : null,
-                        ),
+                          const SizedBox(height: 14),
+                          const Text('or type it',
+                              style: TextStyle(
+                                  fontSize: 12, color: AppColors.textMuted)),
+                          const SizedBox(height: 10),
+                          TextFormField(
+                            controller: _setupCodeController,
+                            decoration: _inputDecoration(
+                              label: 'Setup Code',
+                              icon: Icons.qr_code_rounded,
+                            ),
+                            style: const TextStyle(color: AppColors.textPrimary),
+                            validator: (v) => v == null || v.trim().isEmpty
+                                ? 'Scan the QR, or type the setup code'
+                                : null,
+                          ),
+                          const SizedBox(height: 16),
+                          TextFormField(
+                            controller: _newPinController,
+                            decoration: _inputDecoration(
+                              label: 'Choose a PIN',
+                              icon: Icons.lock_outline_rounded,
+                              suffixIcon: IconButton(
+                                icon: Icon(
+                                  _obscurePassword
+                                      ? Icons.visibility_off_outlined
+                                      : Icons.visibility_outlined,
+                                  color: AppColors.textMuted,
+                                  size: 20,
+                                ),
+                                onPressed: () => setState(
+                                    () => _obscurePassword = !_obscurePassword),
+                              ),
+                            ),
+                            obscureText: _obscurePassword,
+                            keyboardType: TextInputType.number,
+                            style: const TextStyle(
+                                color: AppColors.textPrimary, letterSpacing: 4),
+                            onFieldSubmitted: (_) => _setup(),
+                            validator: (v) => v == null || v.length < 4
+                                ? 'Use at least 4 digits'
+                                : null,
+                          ),
+                          const SizedBox(height: 10),
+                          const Text(
+                            'Remember this PIN. You will use it every time you sign in.',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(fontSize: 12, color: AppColors.textMuted),
+                          ),
+                        ]
+
+                        // ── NORMAL SIGN-IN ─────────────────────────────────
+                        else ...[
+                          TextFormField(
+                            controller: _loginCodeController,
+                            decoration: _inputDecoration(
+                              label: 'Driver ID',
+                              icon: Icons.badge_rounded,
+                            ),
+                            keyboardType: TextInputType.number,
+                            style: const TextStyle(
+                              color: AppColors.textPrimary,
+                              fontSize: 18,
+                              letterSpacing: 2,
+                              fontWeight: FontWeight.w600,
+                            ),
+                            validator: (v) => v == null || v.trim().isEmpty
+                                ? 'Enter your Driver ID'
+                                : null,
+                          ),
+                          const SizedBox(height: 16),
+                          TextFormField(
+                            controller: _pinController,
+                            decoration: _inputDecoration(
+                              label: 'PIN',
+                              icon: Icons.lock_outline_rounded,
+                              suffixIcon: IconButton(
+                                icon: Icon(
+                                  _obscurePassword
+                                      ? Icons.visibility_off_outlined
+                                      : Icons.visibility_outlined,
+                                  color: AppColors.textMuted,
+                                  size: 20,
+                                ),
+                                onPressed: () => setState(
+                                    () => _obscurePassword = !_obscurePassword),
+                              ),
+                            ),
+                            obscureText: _obscurePassword,
+                            keyboardType: TextInputType.number,
+                            style: const TextStyle(
+                                color: AppColors.textPrimary, letterSpacing: 4),
+                            onFieldSubmitted: (_) => _login(),
+                            validator: (v) =>
+                                v == null || v.isEmpty ? 'Enter your PIN' : null,
+                          ),
+                        ],
                         const SizedBox(height: 32),
 
                         // Login button
@@ -599,7 +850,9 @@ class _LoginScreenState extends State<LoginScreen>
                               ],
                             ),
                             child: ElevatedButton(
-                              onPressed: _isLoading ? null : _login,
+                              onPressed: _isLoading
+                                  ? null
+                                  : (_isSetupMode ? _setup : _login),
                               style: ElevatedButton.styleFrom(
                                 backgroundColor: Colors.transparent,
                                 shadowColor: Colors.transparent,
@@ -616,15 +869,39 @@ class _LoginScreenState extends State<LoginScreen>
                                         color: Colors.white,
                                       ),
                                     )
-                                  : const Text(
-                                      'SIGN IN',
-                                      style: TextStyle(
+                                  : Text(
+                                      _isSetupMode ? 'FINISH SETUP' : 'SIGN IN',
+                                      style: const TextStyle(
                                         fontSize: 16,
                                         fontWeight: FontWeight.w700,
                                         color: Colors.white,
                                         letterSpacing: 1.2,
                                       ),
                                     ),
+                            ),
+                          ),
+                        ),
+
+                        // Toggle between first-run setup and normal sign-in.
+                        const SizedBox(height: 10),
+                        TextButton(
+                          onPressed: _isLoading
+                              ? null
+                              : () => setState(() {
+                                    _isSetupMode = !_isSetupMode;
+                                    _errorMessage = '';
+                                    _formKey.currentState?.reset();
+                                  }),
+                          child: Text(
+                            _isSetupMode
+                                ? 'I already have a PIN — sign in'
+                                : 'First time on this phone? Set it up',
+                            // Not const: AppColors.accent is resolved from the
+                            // school's branding at runtime, not a literal.
+                            style: TextStyle(
+                              fontSize: 13,
+                              color: AppColors.accent,
+                              fontWeight: FontWeight.w600,
                             ),
                           ),
                         ),
@@ -679,623 +956,4 @@ class _LoginScreenState extends State<LoginScreen>
       ),
     );
   }
-}
-
-// =============================================================================
-// DASHBOARD SCREEN — Premium transport control center
-// =============================================================================
-class DashboardScreen extends StatefulWidget {
-  final String token;
-  final String driverName;
-  final String vehicleNumber;
-  final String schoolName;
-
-  const DashboardScreen({
-    super.key,
-    required this.token,
-    required this.driverName,
-    required this.vehicleNumber,
-    required this.schoolName,
-  });
-
-  @override
-  State<DashboardScreen> createState() => _DashboardScreenState();
-}
-
-class _DashboardScreenState extends State<DashboardScreen>
-    with SingleTickerProviderStateMixin {
-  bool _isTripActive = false;
-  bool _isToggling = false;
-
-  late AnimationController _pulseController;
-  late Animation<double> _pulseAnim;
-
-  @override
-  void initState() {
-    super.initState();
-    _pulseController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 1500),
-    );
-    _pulseAnim = Tween<double>(begin: 1.0, end: 1.15).animate(
-      CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
-    );
-
-    // Once-per-run "update available" check (silent on any failure).
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) UpdateService.maybePrompt(context);
-    });
-  }
-
-  @override
-  void dispose() {
-    _pulseController.dispose();
-    super.dispose();
-  }
-
-  void _startPulse() {
-    _pulseController.repeat(reverse: true);
-  }
-
-  void _stopPulse() {
-    _pulseController.stop();
-    _pulseController.reset();
-  }
-
-  Future<void> _toggleTrip() async {
-    setState(() => _isToggling = true);
-
-    try {
-      if (!_isTripActive) {
-        // ── Step 1: Check if GPS/Location Services are enabled ──
-        final serviceEnabled = await Geolocator.isLocationServiceEnabled();
-        if (!serviceEnabled) {
-          if (!mounted) return;
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: const Row(
-                children: [
-                  Icon(Icons.location_disabled, color: Colors.white, size: 18),
-                  SizedBox(width: 10),
-                  Expanded(child: Text('Location services are OFF. Please enable GPS.')),
-                ],
-              ),
-              backgroundColor: AppColors.warning,
-              behavior: SnackBarBehavior.floating,
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-              action: SnackBarAction(
-                label: 'OPEN SETTINGS',
-                textColor: Colors.white,
-                onPressed: () => Geolocator.openLocationSettings(),
-              ),
-            ),
-          );
-          setState(() => _isToggling = false);
-          return;
-        }
-
-        // ── Step 2: Foreground location permission ──
-        LocationPermission permission = await Geolocator.checkPermission();
-        if (permission == LocationPermission.denied) {
-          permission = await Geolocator.requestPermission();
-        }
-        if (permission == LocationPermission.denied ||
-            permission == LocationPermission.deniedForever) {
-          if (!mounted) return;
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: const Row(
-                children: [
-                  Icon(Icons.location_off, color: Colors.white, size: 18),
-                  SizedBox(width: 10),
-                  Expanded(child: Text('Location permission is required to track.')),
-                ],
-              ),
-              backgroundColor: AppColors.danger,
-              behavior: SnackBarBehavior.floating,
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-              action: permission == LocationPermission.deniedForever
-                  ? SnackBarAction(
-                      label: 'SETTINGS',
-                      textColor: Colors.white,
-                      onPressed: () => Geolocator.openAppSettings(),
-                    )
-                  : null,
-            ),
-          );
-          setState(() => _isToggling = false);
-          return;
-        }
-
-        // ── Step 3: Background location permission (Android 10+) ──
-        // Without this, the foreground service CANNOT access GPS when app is swiped away.
-        // On Android 10+, this must be requested SEPARATELY after foreground is granted.
-        if (permission == LocationPermission.whileInUse) {
-          // Show explanation dialog first, then request
-          if (!mounted) return;
-          final shouldRequest = await showDialog<bool>(
-            context: context,
-            barrierDismissible: false,
-            builder: (ctx) => AlertDialog(
-              backgroundColor: AppColors.surface,
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-              title: Row(
-                children: [
-                  Icon(Icons.gps_fixed, color: AppColors.accent, size: 24),
-                  const SizedBox(width: 10),
-                  const Text('Background Location',
-                      style: TextStyle(color: AppColors.textPrimary, fontSize: 18)),
-                ],
-              ),
-              content: const Text(
-                'For tracking to work when the app is closed, please select '
-                '"Allow all the time" on the next screen.\n\n'
-                'This ensures parents can see the bus location even when '
-                'the app is in the background.',
-                style: TextStyle(color: AppColors.textSecondary, height: 1.5),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.pop(ctx, false),
-                  child: const Text('Skip', style: TextStyle(color: AppColors.textMuted)),
-                ),
-                ElevatedButton(
-                  onPressed: () => Navigator.pop(ctx, true),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: AppColors.accent,
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                  ),
-                  child: const Text('Continue', style: TextStyle(color: Colors.white)),
-                ),
-              ],
-            ),
-          );
-
-          if (shouldRequest == true) {
-            permission = await Geolocator.requestPermission();
-          }
-          // Even if they skip or only grant whileInUse, we proceed — the foreground
-          // service will still work while the app is visible. It may stop when swiped.
-        }
-      }
-
-      final result = await ApiService.toggleTrip(
-        widget.token,
-        _isTripActive ? 'stop' : 'start',
-      );
-
-      if (!mounted) return;
-
-      if (result['status'] == 'success') {
-        final service = FlutterBackgroundService();
-
-        if (!_isTripActive) {
-          await service.startService();
-          _startPulse();
-        } else {
-          service.invoke('stopService');
-          _stopPulse();
-        }
-
-        setState(() => _isTripActive = !_isTripActive);
-
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Row(
-              children: [
-                Icon(
-                  _isTripActive ? Icons.gps_fixed : Icons.gps_off,
-                  color: Colors.white,
-                  size: 18,
-                ),
-                const SizedBox(width: 10),
-                Text(
-                  _isTripActive
-                      ? 'Trip Started — Tracking ON'
-                      : 'Trip Stopped — Tracking OFF',
-                ),
-              ],
-            ),
-            backgroundColor: _isTripActive ? AppColors.successDark : AppColors.warning,
-            behavior: SnackBarBehavior.floating,
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-          ),
-        );
-      } else {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(result['message'] ?? 'Failed to toggle trip'),
-            backgroundColor: AppColors.danger,
-            behavior: SnackBarBehavior.floating,
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-          ),
-        );
-      }
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Error: ${e.toString()}'),
-          backgroundColor: AppColors.danger,
-          behavior: SnackBarBehavior.floating,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-        ),
-      );
-    } finally {
-      if (mounted) setState(() => _isToggling = false);
-    }
-  }
-
-  Future<void> _logout() async {
-    final confirm = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: AppColors.surface,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: const Text('Logout', style: TextStyle(color: AppColors.textPrimary)),
-        content: const Text(
-          'Are you sure you want to logout?',
-          style: TextStyle(color: AppColors.textSecondary),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Cancel', style: TextStyle(color: AppColors.textMuted)),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            style: TextButton.styleFrom(foregroundColor: AppColors.danger),
-            child: const Text('Logout'),
-          ),
-        ],
-      ),
-    );
-
-    if (confirm == true) {
-      final service = FlutterBackgroundService();
-      service.invoke('stopService');
-
-      if (_isTripActive) {
-        await ApiService.toggleTrip(widget.token, 'stop');
-      }
-
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.remove('api_token');
-      await prefs.remove('driver_name');
-      await prefs.remove('vehicle_number');
-      await prefs.remove('school_name');
-      await prefs.remove('school_id');
-
-      if (!mounted) return;
-      Navigator.pushReplacement(
-        context,
-        _fadeRoute(const LoginScreen()),
-      );
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final statusColor = _isTripActive ? AppColors.success : AppColors.textMuted;
-
-    return Scaffold(
-      body: Container(
-        decoration: const BoxDecoration(
-          gradient: LinearGradient(
-            begin: Alignment.topCenter,
-            end: Alignment.bottomCenter,
-            colors: [AppColors.cardDark, AppColors.primary],
-          ),
-        ),
-        child: SafeArea(
-          child: Column(
-            children: [
-              // Custom AppBar
-              Padding(
-                padding: const EdgeInsets.fromLTRB(20, 16, 12, 0),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            'Hello, ${widget.driverName.split(' ').first} 👋',
-                            style: const TextStyle(
-                              fontSize: 22,
-                              fontWeight: FontWeight.bold,
-                              color: AppColors.textPrimary,
-                            ),
-                          ),
-                          const SizedBox(height: 2),
-                          Text(
-                            widget.schoolName,
-                            style: const TextStyle(
-                              fontSize: 13,
-                              color: AppColors.textSecondary,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    // Status indicator dot
-                    Container(
-                      width: 10,
-                      height: 10,
-                      margin: const EdgeInsets.only(right: 4),
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        color: statusColor,
-                        boxShadow: _isTripActive
-                            ? [BoxShadow(color: statusColor.withOpacity(0.5), blurRadius: 8)]
-                            : null,
-                      ),
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.logout_rounded, color: AppColors.textMuted),
-                      tooltip: 'Logout',
-                      onPressed: _logout,
-                    ),
-                  ],
-                ),
-              ),
-
-              const SizedBox(height: 28),
-
-              // Vehicle info card
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 20),
-                child: Container(
-                  decoration: BoxDecoration(
-                    gradient: LinearGradient(
-                      colors: [
-                        AppColors.surfaceLight.withOpacity(0.7),
-                        AppColors.surface.withOpacity(0.5),
-                      ],
-                    ),
-                    borderRadius: BorderRadius.circular(20),
-                    border: Border.all(color: AppColors.textMuted.withOpacity(0.1)),
-                  ),
-                  padding: const EdgeInsets.all(20),
-                  child: Row(
-                    children: [
-                      // Avatar
-                      Container(
-                        width: 52,
-                        height: 52,
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          gradient: LinearGradient(
-                            colors: [
-                              AppColors.accent.withOpacity(0.2),
-                              AppColors.accentDark.withOpacity(0.1),
-                            ],
-                          ),
-                          border: Border.all(color: AppColors.accent.withOpacity(0.3)),
-                        ),
-                        child: Icon(
-                          Icons.person_rounded,
-                          color: AppColors.accent,
-                          size: 26,
-                        ),
-                      ),
-                      const SizedBox(width: 16),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              widget.driverName,
-                              style: const TextStyle(
-                                fontSize: 17,
-                                fontWeight: FontWeight.w600,
-                                color: AppColors.textPrimary,
-                              ),
-                            ),
-                            const SizedBox(height: 6),
-                            Row(
-                              children: [
-                                Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                                  decoration: BoxDecoration(
-                                    color: AppColors.accent.withOpacity(0.1),
-                                    borderRadius: BorderRadius.circular(8),
-                                    border: Border.all(color: AppColors.accent.withOpacity(0.2)),
-                                  ),
-                                  child: Row(
-                                    mainAxisSize: MainAxisSize.min,
-                                    children: [
-                                      Icon(Icons.directions_bus_rounded,
-                                          color: AppColors.accent, size: 14),
-                                      const SizedBox(width: 6),
-                                      Text(
-                                        widget.vehicleNumber.isNotEmpty
-                                            ? widget.vehicleNumber
-                                            : 'N/A',
-                                        style: TextStyle(
-                                          color: AppColors.accent,
-                                          fontSize: 13,
-                                          fontWeight: FontWeight.w600,
-                                          letterSpacing: 0.5,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-
-              // Trip control — center of screen
-              Expanded(
-                child: Center(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      // GPS status ring
-                      AnimatedBuilder(
-                        animation: _pulseAnim,
-                        builder: (context, child) {
-                          return Transform.scale(
-                            scale: _isTripActive ? _pulseAnim.value : 1.0,
-                            child: Container(
-                              width: 130,
-                              height: 130,
-                              decoration: BoxDecoration(
-                                shape: BoxShape.circle,
-                                color: _isTripActive
-                                    ? AppColors.success.withOpacity(0.05)
-                                    : AppColors.textMuted.withOpacity(0.05),
-                                border: Border.all(
-                                  color: _isTripActive
-                                      ? AppColors.success.withOpacity(0.3)
-                                      : AppColors.textMuted.withOpacity(0.15),
-                                  width: 2,
-                                ),
-                                boxShadow: _isTripActive
-                                    ? [
-                                        BoxShadow(
-                                          color: AppColors.success.withOpacity(0.15),
-                                          blurRadius: 40,
-                                          spreadRadius: 10,
-                                        ),
-                                      ]
-                                    : null,
-                              ),
-                              child: Icon(
-                                _isTripActive ? Icons.gps_fixed_rounded : Icons.gps_off_rounded,
-                                size: 56,
-                                color: _isTripActive ? AppColors.success : AppColors.textMuted,
-                              ),
-                            ),
-                          );
-                        },
-                      ),
-                      const SizedBox(height: 20),
-                      // Status text
-                      Text(
-                        _isTripActive ? 'TRACKING ACTIVE' : 'TRACKING INACTIVE',
-                        style: TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.w700,
-                          color: _isTripActive ? AppColors.success : AppColors.textMuted,
-                          letterSpacing: 2.0,
-                        ),
-                      ),
-                      const SizedBox(height: 6),
-                      Text(
-                        _isTripActive
-                            ? 'GPS location is being shared with parents'
-                            : 'Tap the button below to start your trip',
-                        style: const TextStyle(
-                          fontSize: 13,
-                          color: AppColors.textSecondary,
-                        ),
-                      ),
-                      const SizedBox(height: 40),
-
-                      // Big action button
-                      Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 40),
-                        child: SizedBox(
-                          width: double.infinity,
-                          height: 58,
-                          child: DecoratedBox(
-                            decoration: BoxDecoration(
-                              gradient: LinearGradient(
-                                colors: _isTripActive
-                                    ? [AppColors.danger, AppColors.dangerDark]
-                                    : [AppColors.success, AppColors.successDark],
-                              ),
-                              borderRadius: BorderRadius.circular(16),
-                              boxShadow: [
-                                BoxShadow(
-                                  color: (_isTripActive ? AppColors.danger : AppColors.success)
-                                      .withOpacity(0.35),
-                                  blurRadius: 20,
-                                  offset: const Offset(0, 8),
-                                ),
-                              ],
-                            ),
-                            child: ElevatedButton.icon(
-                              onPressed: _isToggling ? null : _toggleTrip,
-                              style: ElevatedButton.styleFrom(
-                                backgroundColor: Colors.transparent,
-                                shadowColor: Colors.transparent,
-                                shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(16),
-                                ),
-                              ),
-                              icon: _isToggling
-                                  ? const SizedBox(
-                                      width: 22,
-                                      height: 22,
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 2.5,
-                                        color: Colors.white,
-                                      ),
-                                    )
-                                  : Icon(
-                                      _isTripActive
-                                          ? Icons.stop_circle_rounded
-                                          : Icons.play_circle_fill_rounded,
-                                      color: Colors.white,
-                                      size: 24,
-                                    ),
-                              label: _isToggling
-                                  ? const SizedBox.shrink()
-                                  : Text(
-                                      _isTripActive ? 'STOP TRIP' : 'START TRIP',
-                                      style: const TextStyle(
-                                        fontSize: 17,
-                                        fontWeight: FontWeight.w700,
-                                        color: Colors.white,
-                                        letterSpacing: 1.5,
-                                      ),
-                                    ),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-
-              // Bottom footer
-              Padding(
-                padding: const EdgeInsets.only(bottom: 20),
-                child: Text(
-                  AppConfig.appVersionLabel,
-                  style: TextStyle(
-                    fontSize: 11,
-                    color: AppColors.textMuted.withOpacity(0.4),
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-// =============================================================================
-// SHARED UTILS
-// =============================================================================
-PageRouteBuilder<T> _fadeRoute<T>(Widget page) {
-  return PageRouteBuilder<T>(
-    pageBuilder: (context, animation, secondaryAnimation) => page,
-    transitionsBuilder: (context, animation, secondaryAnimation, child) {
-      return FadeTransition(opacity: animation, child: child);
-    },
-    transitionDuration: const Duration(milliseconds: 400),
-  );
 }
