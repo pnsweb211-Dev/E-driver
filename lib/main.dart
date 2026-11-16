@@ -34,7 +34,13 @@ void main() async {
   final brand = (await BrandingService.loadCached()).effective;
   AppColors.applyBranding(brand);
 
-  await initializeService();
+  // A platform plugin may fail on a cold relaunch. Do not leave the driver
+  // stuck before the first frame because one optional service failed.
+  try {
+    await initializeService();
+  } catch (error, stack) {
+    debugPrint('[DRIVER STARTUP] Service configuration failed: $error\n$stack');
+  }
 
   // The container is built by hand rather than by ProviderScope so the alarm
   // plugin — which is initialised before the first frame and calls back from
@@ -45,22 +51,20 @@ void main() async {
   // school's logo immediately instead of the bundled one.
   container.read(brandingProvider.notifier).state = brand;
 
-  await AlarmService.init(
-    onSelect: (target, actionId) {
-      // Even the "START TRIP" action button lands on the alarm screen rather
-      // than starting the trip outright. Starting needs the tracking gate to
-      // pass first, and a trip that opens on a phone with no background
-      // location is exactly the silent failure §7 exists to prevent.
-      container.read(pendingAlarmProvider.notifier).raise(target);
-    },
-  );
+  try {
+    await AlarmService.init(
+      onSelect: (target, actionId) {
+        // Opening an alarm must still pass through the tracking readiness gate.
+        container.read(pendingAlarmProvider.notifier).raise(target);
+      },
+    );
 
-  // Cold start FROM an alarm is the normal case at 06:45 — the app was not
-  // open. Without this the driver taps the alarm and lands on Today, wondering
-  // what it wanted.
-  final launchedBy = await AlarmService.launchTarget();
-  if (launchedBy != null) {
-    container.read(pendingAlarmProvider.notifier).raise(launchedBy);
+    final launchedBy = await AlarmService.launchTarget();
+    if (launchedBy != null) {
+      container.read(pendingAlarmProvider.notifier).raise(launchedBy);
+    }
+  } catch (error, stack) {
+    debugPrint('[DRIVER STARTUP] Alarm initialization failed: $error\n$stack');
   }
 
   runApp(
@@ -163,6 +167,10 @@ class _Root extends ConsumerStatefulWidget {
 class _RootState extends ConsumerState<_Root> with WidgetsBindingObserver {
   bool _restoring = true;
 
+  // A saved login fires both the Riverpod session listener and the restore
+  // callback on cold launch. Only one should initialize push, alarms and GPS.
+  bool _initializingSession = false;
+
   /// Null until the first sweep finishes. §7 Layer 1 gates on this: a driver
   /// must not reach the Today screen on a phone that cannot track.
   bool? _ready;
@@ -207,39 +215,50 @@ class _RootState extends ConsumerState<_Root> with WidgetsBindingObserver {
   /// Everything that has to happen once there is a signed-in driver: check the
   /// phone, arm the week's alarms, and put the duty service on watch.
   Future<void> _afterSignIn() async {
-    if (ref.read(sessionProvider) == null) return;
+    if (!mounted || _initializingSession || ref.read(sessionProvider) == null) {
+      return;
+    }
 
-    // Reconcile the profile on LAUNCH, not just on resume.
-    //
-    // A restored session is rebuilt from SharedPreferences, so it only ever
-    // holds what was persisted at the last sign-in. Anything the server learned
-    // to send since then — the school's contact details, a mode the office
-    // changed — stayed missing until the driver happened to background and
-    // foreground the app, which on a phone left in a cradle all day is never.
-    //
-    // Not awaited: this is a network round trip and the readiness gate below
-    // must not wait on it. Silent on failure, so an offline launch is unchanged.
-    unawaited(
-      ref.read(sessionProvider.notifier).refreshProfile(ref.read(driverApiProvider)),
-    );
+    _initializingSession = true;
+    try {
+      // Restored sessions are cached. Refresh in the background so an offline
+      // launch never waits for the school server.
+      unawaited(
+        ref.read(sessionProvider.notifier).refreshProfile(ref.read(driverApiProvider)),
+      );
 
-    await _refreshReadiness();
+      await _refreshReadiness();
+      if (!mounted || _ready != true || ref.read(sessionProvider) == null) {
+        return;
+      }
 
-    if (_ready != true) return;
+      // Push already isolates its own errors. Local reminders must still be
+      // attempted if FCM is unavailable on this iPhone.
+      await DriverPush.start();
 
-    // Push before arming: the server's T-30 rung re-arms the alarms while the
-    // app is backgrounded, and it can only do that once this handset has an FCM
-    // token registered against its device row.
-    await DriverPush.start();
+      try {
+        await ref.read(adherenceProvider.notifier).refreshAndArm();
+      } catch (error, stack) {
+        debugPrint('[DRIVER STARTUP] Alarm refresh failed: $error\n$stack');
+      }
 
-    // Arming is idempotent and falls back to the cached timetable offline, so
-    // running it on every launch is both safe and the main re-arm trigger.
-    await ref.read(adherenceProvider.notifier).refreshAndArm();
-
-    // The service decides its own mode from here (trip / watch / idle). Started
-    // unconditionally because Layers 4 and 5 have to work BETWEEN runs — that
-    // is the entire point of them.
-    await TrackingGate.startService();
+      // A failed reminder refresh must not prevent bus tracking from starting.
+      if (!mounted || ref.read(sessionProvider) == null) return;
+      try {
+        await TrackingGate.startService();
+      } catch (error, stack) {
+        debugPrint('[DRIVER STARTUP] Tracking startup failed: $error\n$stack');
+      }
+    } catch (error, stack) {
+      debugPrint('[DRIVER STARTUP] Session initialization failed: $error\n$stack');
+      // Avoid a splash screen that never ends after a platform-plugin error.
+      // The regular readiness screen remains the safe fallback.
+      if (mounted && _ready == null) {
+        setState(() => _ready = false);
+      }
+    } finally {
+      _initializingSession = false;
+    }
   }
 
   Future<void> _refreshReadiness() async {

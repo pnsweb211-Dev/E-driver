@@ -323,12 +323,22 @@ void onStart(ServiceInstance service) async {
   // A much cheaper stream: 100 m of movement before a callback, no uploads, no
   // wake lock. All it answers is "has this bus left without a trip open?".
   void startWatchStream(DutyWindow window) {
+    final LocationSettings watchSettings = Platform.isIOS
+        ? AppleSettings(
+            accuracy: LocationAccuracy.medium,
+            distanceFilter: 100,
+            activityType: ActivityType.automotiveNavigation,
+            pauseLocationUpdatesAutomatically: false,
+            showBackgroundLocationIndicator: false,
+          )
+        : AndroidSettings(
+            accuracy: LocationAccuracy.medium,
+            distanceFilter: 100,
+            intervalDuration: const Duration(seconds: 60),
+          );
+
     positionSubscription = Geolocator.getPositionStream(
-      locationSettings: AndroidSettings(
-        accuracy: LocationAccuracy.medium,
-        distanceFilter: 100,
-        intervalDuration: const Duration(seconds: 60),
-      ),
+      locationSettings: watchSettings,
     ).listen(
       (Position position) async {
         if (position.accuracy > 200) return;
@@ -437,6 +447,11 @@ Future<void> _showMotionAlert(DutyWindow window) async {
   await plugin.initialize(
     const InitializationSettings(
       android: AndroidInitializationSettings('@mipmap/ic_launcher'),
+      iOS: DarwinInitializationSettings(
+        requestAlertPermission: false,
+        requestBadgePermission: false,
+        requestSoundPermission: false,
+      ),
     ),
   );
 
@@ -472,6 +487,7 @@ Future<void> _showMotionAlert(DutyWindow window) async {
               showsUserInterface: true, cancelNotification: true),
         ],
       ),
+      iOS: DarwinNotificationDetails(),
     ),
     payload: target.encode(),
   );
