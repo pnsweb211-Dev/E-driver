@@ -1,9 +1,12 @@
+import 'dart:io';
+
 import 'package:geolocator/geolocator.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../alarms/alarm_service.dart';
 import 'device_channel.dart';
+import 'notification_permission.dart';
 
 /// One row of the pre-flight checklist (§7 Layer 1).
 enum ReadinessItem {
@@ -84,21 +87,31 @@ class ReadinessService {
   static const _ackKey = 'readiness_acknowledged_v1';
 
   static Future<ReadinessReport> evaluate() async {
+    final isAndroid = Platform.isAndroid;
+    final isIOS = Platform.isIOS;
     final servicesOn = await Geolocator.isLocationServiceEnabled();
     final permission = await Geolocator.checkPermission();
-    final notifications = await Permission.notification.isGranted;
-    final channelOk = await AlarmService.alarmChannelIsAudible();
+    final notifications = await NotificationPermission.isGranted();
+    final channelOk = isAndroid
+        ? await AlarmService.alarmChannelIsAudible()
+        : true;
 
     // On Android 11 and below the permission does not exist and exact alarms
     // simply work; permission_handler reports `granted` there, so no special
     // case is needed — but do not "improve" this into a version check.
-    final exact = await Permission.scheduleExactAlarm.isGranted;
-    final battery = await Permission.ignoreBatteryOptimizations.isGranted;
+    final exact = isAndroid
+        ? await Permission.scheduleExactAlarm.isGranted
+        : true;
+    final battery = isAndroid
+        ? await Permission.ignoreBatteryOptimizations.isGranted
+        : true;
 
-    final hasAutostart = await DeviceChannel.hasAutostartSettings();
+    final hasAutostart = isAndroid && await DeviceChannel.hasAutostartSettings();
     final brand = hasAutostart ? await DeviceChannel.manufacturer() : '';
     final autostartAcked = await _acknowledged(ReadinessItem.autostart);
-    final autoTime = await DeviceChannel.isAutoTimeEnabled();
+    final autoTime = isAndroid
+        ? await DeviceChannel.isAutoTimeEnabled()
+        : true;
 
     return ReadinessReport([
       ReadinessCheck(
@@ -112,11 +125,16 @@ class ReadinessService {
       ReadinessCheck(
         item: ReadinessItem.locationAlways,
         severity: ReadinessSeverity.blocking,
-        title: 'Location set to "Allow all the time"',
-        why: 'On "While using the app", tracking stops the moment your screen '
-            'locks — and parents stop seeing the bus.',
+        title: isIOS
+            ? 'Location access set to Always'
+            : 'Location set to "Allow all the time"',
+        why: isIOS
+            ? 'Allows location updates during assigned trips when the app '
+                'moves into the background.'
+            : 'On "While using the app", tracking stops the moment your screen '
+                'locks — and parents stop seeing the bus.',
         passed: permission == LocationPermission.always,
-        fixLabel: 'Allow',
+        fixLabel: isIOS ? 'Continue' : 'Allow',
       ),
       ReadinessCheck(
         item: ReadinessItem.notifications,
@@ -124,9 +142,9 @@ class ReadinessService {
         title: 'Notifications allowed',
         why: 'This is how the app reminds you to start the run.',
         passed: notifications,
-        fixLabel: 'Allow',
+        fixLabel: isIOS ? 'Continue' : 'Allow',
       ),
-      ReadinessCheck(
+      if (isAndroid) ReadinessCheck(
         item: ReadinessItem.alarmChannel,
         severity: ReadinessSeverity.blocking,
         title: 'Trip Alarms not muted',
@@ -134,7 +152,7 @@ class ReadinessService {
         passed: channelOk,
         fixLabel: 'Unmute',
       ),
-      ReadinessCheck(
+      if (isAndroid) ReadinessCheck(
         item: ReadinessItem.exactAlarms,
         severity: ReadinessSeverity.blocking,
         title: 'Alarms can ring on time',
@@ -142,7 +160,7 @@ class ReadinessService {
         passed: exact,
         fixLabel: 'Allow',
       ),
-      ReadinessCheck(
+      if (isAndroid) ReadinessCheck(
         item: ReadinessItem.batteryOptimisation,
         severity: ReadinessSeverity.blocking,
         title: 'Battery saver exemption',
@@ -164,7 +182,7 @@ class ReadinessService {
           passed: autostartAcked,
           fixLabel: 'Open',
         ),
-      ReadinessCheck(
+      if (isAndroid) ReadinessCheck(
         item: ReadinessItem.autoTime,
         severity: ReadinessSeverity.advisory,
         title: 'Automatic date & time',
@@ -183,14 +201,17 @@ class ReadinessService {
         await Geolocator.openLocationSettings();
 
       case ReadinessItem.locationAlways:
-        // Android only offers "Allow all the time" once foreground location is
-        // already granted, so this legitimately takes two passes — which is
-        // why the screen re-checks instead of assuming one request was enough.
+        // Android only offers "Allow all the time" after foreground access.
+        // iOS may also require a second settings step for Always authorization.
         final current = await Geolocator.checkPermission();
 
         if (current == LocationPermission.denied) {
           await Geolocator.requestPermission();
         } else if (current == LocationPermission.deniedForever) {
+          await Geolocator.openAppSettings();
+        } else if (Platform.isIOS) {
+          // Don't call Android's permission_handler locationAlways path on iOS.
+          // iOS manages escalation to Always in its own authorization flow.
           await Geolocator.openAppSettings();
         } else {
           final result = await Permission.locationAlways.request();
@@ -198,18 +219,21 @@ class ReadinessService {
         }
 
       case ReadinessItem.notifications:
-        final result = await Permission.notification.request();
-        if (!result.isGranted) await openAppSettings();
+        await NotificationPermission.requestOrOpenSettings();
 
       case ReadinessItem.alarmChannel:
         await AlarmService.openAlarmChannelSettings();
 
       case ReadinessItem.exactAlarms:
-        final result = await Permission.scheduleExactAlarm.request();
-        if (!result.isGranted) await openAppSettings();
+        if (Platform.isAndroid) {
+          final result = await Permission.scheduleExactAlarm.request();
+          if (!result.isGranted) await openAppSettings();
+        }
 
       case ReadinessItem.batteryOptimisation:
-        await Permission.ignoreBatteryOptimizations.request();
+        if (Platform.isAndroid) {
+          await Permission.ignoreBatteryOptimizations.request();
+        }
 
       case ReadinessItem.autostart:
         final opened = await DeviceChannel.openAutostartSettings();

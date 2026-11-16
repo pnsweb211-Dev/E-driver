@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:geolocator/geolocator.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -6,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../api/driver_api.dart';
 import '../outbox/outbox.dart';
 import 'device_channel.dart';
+import 'notification_permission.dart';
 
 /// §7 Layer 5 — the liveness beat that makes a silent bus diagnosable.
 ///
@@ -71,13 +74,22 @@ class Heartbeat {
   /// belongs in a two-minute background timer.
   static Future<Map<String, bool>> _permissionSnapshot() async {
     final permission = await Geolocator.checkPermission();
+    // A background iOS engine may not expose the AppDelegate channel. Treat
+    // unavailable as unknown, not as notification permission denied.
+    final bool? notifications = Platform.isIOS
+        ? await NotificationPermission.iosNativeStatus()
+        : await NotificationPermission.isGranted();
 
     return {
       'locationServices': await Geolocator.isLocationServiceEnabled(),
       'locationAlways': permission == LocationPermission.always,
-      'notifications': await Permission.notification.isGranted,
-      'exactAlarms': await Permission.scheduleExactAlarm.isGranted,
-      'batteryOptimisation': await Permission.ignoreBatteryOptimizations.isGranted,
+      if (notifications != null) 'notifications': notifications,
+      // Android permissions must never be posted as failed iOS requirements.
+      if (Platform.isAndroid) ...{
+        'exactAlarms': await Permission.scheduleExactAlarm.isGranted,
+        'batteryOptimisation':
+            await Permission.ignoreBatteryOptimizations.isGranted,
+      },
     };
   }
 

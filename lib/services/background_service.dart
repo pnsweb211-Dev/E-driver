@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:ui';
 
 import 'package:flutter_background_service/flutter_background_service.dart';
@@ -158,24 +159,30 @@ void onStart(ServiceInstance service) async {
   //   2. getCurrentPosition() opens a new GPS session each call (cold-start)
   //   3. the timer isolate gets killed by the OOM killer
   //
-  // The stream uses a persistent platform channel that keeps the GPS radio
-  // alive, survives Doze as a foreground-service location request, and streams
-  // via the native LocationCallback.
+  // On Android a foreground-service location request survives Doze. On iOS,
+  // Core Location uses a separate automotive-navigation background policy.
   void startTripStream() {
-    final LocationSettings locationSettings = AndroidSettings(
-      accuracy: LocationAccuracy.bestForNavigation,
-      // Minimum distance change (metres) before we get a callback. 10 m keeps a
-      // stationary bus from flooding the API.
-      distanceFilter: 10,
-      intervalDuration: const Duration(seconds: 10),
-      foregroundNotificationConfig: const ForegroundNotificationConfig(
-        notificationTitle: 'School Bus Tracker',
-        notificationText: 'Tracking your route...',
-        notificationChannelName: 'Vehicle Tracking',
-        setOngoing: true,
-        enableWakeLock: true, // ← acquires WAKE_LOCK automatically
-      ),
-    );
+    final LocationSettings locationSettings = Platform.isIOS
+        ? AppleSettings(
+            accuracy: LocationAccuracy.bestForNavigation,
+            distanceFilter: 10,
+            activityType: ActivityType.automotiveNavigation,
+            pauseLocationUpdatesAutomatically: false,
+            showBackgroundLocationIndicator: true,
+          )
+        : AndroidSettings(
+            accuracy: LocationAccuracy.bestForNavigation,
+            // Minimum distance change (metres) before we get a callback.
+            distanceFilter: 10,
+            intervalDuration: const Duration(seconds: 10),
+            foregroundNotificationConfig: const ForegroundNotificationConfig(
+              notificationTitle: 'School Bus Tracker',
+              notificationText: 'Tracking your route...',
+              notificationChannelName: 'Vehicle Tracking',
+              setOngoing: true,
+              enableWakeLock: true, // ← acquires WAKE_LOCK automatically
+            ),
+          );
 
     // §6.2 adaptive interval. The GPS stream still ticks at 10 s — turning the
     // radio down and up is what actually costs battery, and it is also what

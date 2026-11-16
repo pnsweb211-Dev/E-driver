@@ -105,6 +105,12 @@ class AlarmService {
     await _plugin.initialize(
       const InitializationSettings(
         android: AndroidInitializationSettings('@mipmap/ic_launcher'),
+        // iOS permissions belong to the post-login readiness flow, not startup.
+        iOS: DarwinInitializationSettings(
+          requestAlertPermission: false,
+          requestBadgePermission: false,
+          requestSoundPermission: false,
+        ),
       ),
       onDidReceiveNotificationResponse: (response) {
         final target = AlarmTarget.decode(response.payload);
@@ -272,6 +278,11 @@ class AlarmService {
       body,
       at,
       NotificationDetails(
+        iOS: const DarwinNotificationDetails(
+          presentAlert: true,
+          presentSound: true,
+          presentBadge: true,
+        ),
         android: AndroidNotificationDetails(
           isAlarm ? alarmChannelId : reminderChannelId,
           isAlarm ? 'Trip Alarms' : 'Trip Reminders',
