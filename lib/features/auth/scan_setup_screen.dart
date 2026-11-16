@@ -70,7 +70,7 @@ class _ScanSetupScreenState extends State<ScanSetupScreen> {
             onDetect: _onDetect,
             // A camera that is switched off, or a device with none, must not
             // leave a black rectangle and no explanation.
-            errorBuilder: (context, error, _) => Center(
+            errorBuilder: (context, error) => Center(
               child: Padding(
                 padding: const EdgeInsets.all(32),
                 child: Column(

@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io' show Platform;
 
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
@@ -29,6 +30,16 @@ class DriverPush {
   static const _configKey = 'firebase_config';
 
   static bool _started = false;
+
+  // TEMPORARY iOS diagnostic safety switch for the 2026-11-16 native SIGABRT.
+  // The crash stack reaches FIRApp.configureWithName on a restored session.
+  // Leave iOS FCM OFF in this test build until a valid iOS Firebase app is
+  // registered for com.vidhyaaahvanbus.pnsweb and the iOS config is verified.
+  // Android push behavior remains unchanged.
+  // Re-enable for a separate TEST build only with:
+  // --dart-define=DRIVER_IOS_FCM_ENABLED=true
+  static const bool _iosFcmEnabled =
+      bool.fromEnvironment('DRIVER_IOS_FCM_ENABLED', defaultValue: false);
 
   /// The T-30 rung is data-only and carries `action: rearm_alarms`. Re-arming
   /// from it is what keeps a phone that has been backgrounded for days ringing
@@ -67,6 +78,10 @@ class DriverPush {
   /// Returns false when there is nothing configured — a perfectly normal state
   /// for a deployment that has not set up FCM, and never an error.
   static Future<bool> _ensureFirebase() async {
+    // A bad Firebase config causes an Objective-C NSException on iOS. Dart
+    // try/catch cannot catch that native exception, so skip Firebase entirely
+    // in the iOS stability test. GPS and local alarms are separate services.
+    if (Platform.isIOS && !_iosFcmEnabled) return false;
     if (Firebase.apps.isNotEmpty) return true;
 
     final config = await _storedConfig();
@@ -83,6 +98,21 @@ class DriverPush {
     // class exists to remove.
     if (appId.isEmpty || apiKey.isEmpty || senderId.isEmpty || projectId.isEmpty) {
       return false;
+    }
+
+    // An Android Firebase APP ID must never be used to configure an iOS app.
+    // When the iOS switch is enabled, preflight the server-provided app ID
+    // before native FIRApp receives it. This does not replace verification
+    // against the actual Firebase console's registered iOS application.
+    if (Platform.isIOS) {
+      final parts = appId.split(':');
+      final validIosAppId = parts.length == 4 &&
+          parts[0] == '1' &&
+          parts[1] == senderId &&
+          RegExp(r'^[0-9]+$').hasMatch(parts[1]) &&
+          parts[2] == 'ios' &&
+          RegExp(r'^[0-9a-fA-F]+$').hasMatch(parts[3]);
+      if (!validIosAppId) return false;
     }
 
     await Firebase.initializeApp(

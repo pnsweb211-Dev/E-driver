@@ -58,5 +58,7 @@
 	<true/>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>Driver App uses the camera to scan school setup QR codes.</string>
 </dict>
 </plist>
