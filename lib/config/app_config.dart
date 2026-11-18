@@ -11,7 +11,7 @@ class AppConfig {
   /// Backend server origin (scheme + host).
   static const String origin = String.fromEnvironment(
     'API_ORIGIN',
-    defaultValue: 'https://multischoolv2.projectworlds.com',
+    defaultValue: 'https://vidhyaaahvanschoolsoftware.com',
   );
 
   // ── App display text ───────────────────────────────────────────────────────
@@ -24,7 +24,7 @@ class AppConfig {
   /// "Powered by" footer text.
   static const String poweredBy = String.fromEnvironment(
     'APP_POWERED_BY',
-    defaultValue: 'Powered by Projectworlds',
+    defaultValue: 'Powered by PNSWEB',
   );
 
   /// Version label shown on the about/profile area.
